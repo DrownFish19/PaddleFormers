@@ -287,7 +287,7 @@ class ERNIEVLToolUtils(ToolUtils):
             json.dumps({"name": name, "arguments": json.loads(arguments)}, ensure_ascii=False)
             for name, arguments in functions
         ]
-        return "\n".join([f"<tool_call{text}\n</tool_call>" for text in function_texts])
+        return "\n".join([f"<tool_call>\n{text}\n</tool_call>" for text in function_texts])
 
 
 TOOLS = {
@@ -295,6 +295,7 @@ TOOLS = {
     "ernie": ERNIEToolUtils(),
     "ernie_vl": ERNIEVLToolUtils(),
     "qwen": QwenToolUtils(),
+    "qwen3_5": QwenToolUtils(),
     "glm4": GLM4ToolUtils(),
     "glm4_moe": GLM4MOEToolUtils(),
     "llama3": Llama3ToolUtils(),

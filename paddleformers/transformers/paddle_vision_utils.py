@@ -16,11 +16,31 @@
 API for image and video processing, serving as a backend for PaddlePaddle processors.
 """
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
+import numpy as np
 import paddle
 from paddle.nn.functional import interpolate
 from paddle.nn.functional import pad as paddle_pad
+from PIL import Image
+
+
+def get_image_num_channels(img: Any) -> int:
+    if isinstance(img, Image.Image):
+        if hasattr(img, "getbands"):
+            return len(img.getbands())
+        else:
+            return img.channels
+    raise TypeError(f"Unexpected type {type(img)}")
+
+
+def pil_to_tensor(pic: Any) -> paddle.Tensor:
+    """Convert a ``PIL Image`` to a tensor of the same type."""
+    img = paddle.as_tensor(np.array(pic, copy=True))
+    img = img.view(pic.size[1], pic.size[0], get_image_num_channels(pic))
+    # put it from HWC to CHW format
+    img = img.permute((2, 0, 1))
+    return img
 
 
 def _pad_symmetric(img: paddle.Tensor, padding: list[int]) -> paddle.Tensor:
@@ -119,10 +139,10 @@ def resize(
         if interpolation == "nearest":
             # uint8 dtype can be included for cpu and cuda input if nearest mode
             acceptable_dtypes.append(paddle.uint8)
-        # NOTE: Paddle currently does not support uint8 resize on CPU. Uncomment this when supported.
-        # elif image.place.is_cpu_place():
-        #     if _should_use_native_uint8_kernel(interpolation):
-        #         acceptable_dtypes.append(paddle.uint8)
+        # NOTE: Paddle currently support uint8 resize on CPU, but may have minor diffs compared with PyTorch.
+        elif image.place.is_cpu_place():
+            if _should_use_native_uint8_kernel(interpolation):
+                acceptable_dtypes.append(paddle.uint8)
 
         image = image.reshape(-1, num_channels, old_height, old_width)
         strides = image.stride()
@@ -226,22 +246,22 @@ def _pad_with_scalar_fill(
         # name.
         padding_mode = "replicate"
 
+    dtype = image.dtype
+    if not image.is_floating_point():
+        needs_cast = True
+        image = image.to(paddle.float32)
+    else:
+        needs_cast = False
+
     if padding_mode == "constant":
         image = paddle_pad(image, paddle_padding, mode=padding_mode, value=float(fill))
     elif padding_mode in ("reflect", "replicate"):
-        dtype = image.dtype
-        if not image.is_floating_point():
-            needs_cast = True
-            image = image.to(paddle.float32)
-        else:
-            needs_cast = False
-
         image = paddle_pad(image, paddle_padding, mode=padding_mode)
-
-        if needs_cast:
-            image = image.to(dtype)
     else:  # padding_mode == "symmetric"
         image = _pad_symmetric(image, paddle_padding)
+
+    if needs_cast:
+        image = image.to(dtype)
 
     new_height, new_width = image.shape[-2:]
 

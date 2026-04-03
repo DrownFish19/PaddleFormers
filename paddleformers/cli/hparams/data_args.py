@@ -75,10 +75,6 @@ class DataArguments:
         default=2048,
         metadata={"help": "Maximum prompt length."},
     )
-    mask_out_eos_token: bool = field(
-        default=False,
-        metadata={"help": "Mask out eos token"},
-    )
     random_shuffle: bool = field(
         default=True,
         metadata={"help": "Whether to enable authorize code for privatization. Defaults to False."},
@@ -143,7 +139,39 @@ class DataArguments:
         metadata={"help": "Whether to skip the warmup process of mmap files."},
     )
     data_cache: str = field(default=None, metadata={"help": "The path of the cached dataset."})
+    truncation_strategy: str = field(
+        default="delete",
+        metadata={"help": "The truncation strategy to use in data processing."},
+    )
     truncate_packing: bool = field(
         default=True,
         metadata={"help": "Whether to truncate data in packing (only valid in pretrain online dataflow)."},
+    )
+    dataset_output_dir: str = field(
+        default="./dataset_output",
+        metadata={"help": "output path of offline sft datasets"},
+    )
+    new_special_tokens_path: str = field(
+        default=None,
+        metadata={"help": "The path of the new special tokens."},
+    )
+    custom_register_path: str = field(
+        default=None,
+        metadata={"help": "Register python file path for custom templates and mm_plugin."},
+    )
+    make_offline_data: bool = field(
+        default=False,
+        metadata={"help": "Make offline data for SFT training."},
+    )
+    processor_use_fast: bool = field(
+        default=None,
+        metadata={"help": "Whether to use fast processor."},
+    )
+    binpacking: bool = field(
+        default=True,
+        metadata={"help": "Whether to use bin packing."},
+    )
+    packing_interval: int = field(
+        default=1000,
+        metadata={"help": "Interval of packing."},
     )

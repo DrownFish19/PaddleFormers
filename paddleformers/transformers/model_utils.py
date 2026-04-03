@@ -2443,9 +2443,9 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     state_dict,
                     config,
                     loaded_keys,
-                    pre_tensor_parallel_split=True
-                    if config is not None and config.tensor_model_parallel_size > 1
-                    else False,
+                    pre_tensor_parallel_split=(
+                        True if config is not None and config.tensor_model_parallel_size > 1 else False
+                    ),
                 )
                 missing_keys = list(set(missing_keys) - set(new_keys))
                 unexpected_keys = list(set(unexpected_keys) - set(fused_keys))
@@ -2573,13 +2573,15 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     state_dict = load_state_dict(
                         shard_file,
                         tp_actions if pre_tensor_parallel_split else None,
-                        {
-                            reverse_key_renaming_mapping[key]
-                            for key in filter_dict_keys
-                            if key in reverse_key_renaming_mapping
-                        }
-                        if key_mapping is not None
-                        else filter_dict_keys,
+                        (
+                            {
+                                reverse_key_renaming_mapping[key]
+                                for key in filter_dict_keys
+                                if key in reverse_key_renaming_mapping
+                            }
+                            if key_mapping is not None
+                            else filter_dict_keys
+                        ),
                         convert_from_hf=convert_from_hf,
                         transpose_weight_keys=cls.transpose_weight_keys,
                     )
@@ -2844,6 +2846,7 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         if low_cpu_mem_usage or config.quantization_config.is_weight_quantize():
             # Instantiate model.
             init_contexts.append(no_init_weights(_enable=True))
+            config.perform_initialization = False
             if is_paddle_support_lazy_init():
                 init_contexts.append(paddle.LazyGuard())
 
@@ -2875,10 +2878,26 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
 
         file_list = resolved_sharded_files if is_sharded else [resolved_archive_file]
         ckpt_path = get_common_folder(file_list)
+
         # 3. init the model
         init_args = config["init_args"] or ()
         with ContextManagers(init_contexts):
+            if (
+                config.quantization_config.is_weight_quantize() and load_checkpoint_format == "flex_checkpoint"
+            ):  # flex_checkpoint need a extra model in cpu to initialize weights
+                copied_config = copy.deepcopy(config)
+                copied_init_args = copy.deepcopy(init_args)
+                copied_model_kwargs = copy.deepcopy(model_kwargs)
+                copied_model = cls(copied_config, *copied_init_args, **copied_model_kwargs)
             model = cls(config, *init_args, **model_kwargs)
+
+        if (
+            config.quantization_config.is_weight_quantize() and load_checkpoint_format == "flex_checkpoint"
+        ):  # flex_checkpoint need initialized weights
+            for name, param in model.named_parameters():
+                with paddle.device_guard("cpu"):
+                    value = paddle.zeros(shape=param.shape, dtype=param.dtype)
+                param.set_value(value)
 
         if load_checkpoint_format == "flex_checkpoint":
             if not hasattr(cls, "_gen_aoa_config"):
@@ -2890,7 +2909,7 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
             sharded_state_dict = model.sharded_state_dict()
             metadata_path = os.path.join(ckpt_path, FLEX_CKPT_AUTO_GENERATED_METADATA)
 
-            # delete the existing metadata file if it exists
+            # delete the metadata file if it exists
             try:
                 os.remove(metadata_path)
             except FileNotFoundError:
@@ -2899,9 +2918,11 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                 logger.error(f"Failed to delete {metadata_path}: {e}")
 
             # change dtype in aoa
-            if dtype is not None:
+            # Skip identity dtype mapping for fleet models — fleet state_dict keys
+            # (e.g. model.visual._layers.0.xxx) differ from HF checkpoint keys,
+            # and _gen_aoa_config already handles critical dtype specs (e.g. gate.weight -> float32)
+            if dtype is not None and not getattr(cls, "is_fleet", False):
                 for key in model.state_dict().keys():
-                    # keep fp32
                     if model.state_dict()[key].dtype == paddle.float32:
                         aoa_config["aoa_statements"].append(f"{key} -> {key}, dtype='float32'")
                     else:
@@ -2918,6 +2939,47 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
             for v in sharded_state_dict.values():
                 if hasattr(v.local_tensor, "target_tensor"):
                     del v.local_tensor.target_tensor
+
+            if config.quantization_config.is_weight_quantize():
+                new_state_dict = copy.deepcopy(model.state_dict())
+                del model
+                model = copied_model
+
+                quantization_linear_list = None
+                if config.quantization_config.is_weight_quantize():
+                    with ContextManagers(quantization_init_contexts):
+                        replace_with_quantization_linear(
+                            model=model,
+                            quantization_config=config.quantization_config,
+                        )
+                        quantization_linear_list = []
+                        for key in model.state_dict().keys():
+                            if "quant_weight" in key:
+                                quantization_linear_list.append(key[:-13])
+
+                if isinstance(model.config, dict):
+                    model.config["quantization_config"].quantization_linear_list = quantization_linear_list
+                else:  # model.config is instance of GPTProvider
+                    model.config.quantization_config.quantization_linear_list = quantization_linear_list
+
+                new_state_dict = convert_to_quantize_state_dict(
+                    new_state_dict,
+                    quantization_linear_list,
+                    config.quantization_config,
+                    dtype,
+                )
+
+                model_state_dict = model.state_dict()
+                set_state_dict = {}
+                for param_name, param in new_state_dict.items():
+                    if config.tie_word_embeddings and "lm_head.weight" in param_name:
+                        continue
+                    with paddle.no_grad():
+                        set_state_dict[param_name] = param.cuda()
+                        model_state_dict[param_name].get_tensor()._share_data_with(
+                            set_state_dict[param_name].value().get_tensor()
+                        )
+                    param.value().get_tensor()._clear()
 
             return model
 
@@ -3121,6 +3183,7 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         save_to_hf = kwargs.get("save_to_hf", True)
 
         save_checkpoint_format = kwargs.get("save_checkpoint_format", "flex_checkpoint")
+        memory_growth_threshold = kwargs.get("memory_growth_threshold", 8 * (2**30))
 
         if kwargs.get("enable_auto_parallel", ""):
             # use flex_checkpoint as the default format in auto_parallel
@@ -3146,6 +3209,16 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         model_to_save = unwrap_model(self)
 
         if save_checkpoint_format == "flex_checkpoint":
+            # autoregressive mtp training
+            autoregressive_mtp_training = model_to_save.config.mtp_num_layers > 0
+            if autoregressive_mtp_training:
+                tmp = model_to_save.config.mtp_num_layers
+                model_to_save.config.mtp_num_layers = model_to_save.config.num_nextn_predict_layers
+                model_to_save.config.num_nextn_predict_layers = tmp
+
+                logger.info(
+                    f"MTP args changing for autoregressive mtp training checkpoint saving, mtp_num_layers: {model_to_save.config.mtp_num_layers}, num_nextn_predict_layers: {model_to_save.config.num_nextn_predict_layers}!!"
+                )
             if not hasattr(self, "_gen_inv_aoa_config"):
                 if hasattr(self, "_gen_aoa_config"):
                     aoa_config = self._gen_aoa_config(model_to_save.config)
@@ -3163,9 +3236,13 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
             clean_unrelated_safetensors(save_dir)
 
             if using_sonic_moe:
-                SonicMoEHFFormatFullParamSaver(model_to_save, aoa_config).save_checkpoint(save_dir, max_shard_size)
+                SonicMoEHFFormatFullParamSaver(
+                    model_to_save, aoa_config, memory_growth_threshold=memory_growth_threshold
+                ).save_checkpoint(save_dir, max_shard_size)
             else:
-                HFFormatFullParamSaver(model_to_save, aoa_config).save_checkpoint(save_dir, max_shard_size)
+                HFFormatFullParamSaver(
+                    model_to_save, aoa_config, memory_growth_threshold=memory_growth_threshold
+                ).save_checkpoint(save_dir, max_shard_size)
 
             dtype = get_parameter_dtype(model_to_save)
             if dtype is not None:
@@ -3176,7 +3253,8 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                 else:
                     config_to_save = copy.deepcopy(model_to_save.config)
                     # Attach architecture to the config
-                    config_to_save.architectures = [clean_model_class_name(model_to_save.__class__.__name__)]
+                    if not config_to_save.architectures:
+                        config_to_save.architectures = [clean_model_class_name(model_to_save.__class__.__name__)]
 
             # Save the config
             if is_main_process:
@@ -3190,6 +3268,15 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     config_to_save.save_pretrained(save_directory)
                 if self.can_generate():
                     model_to_save.generation_config.save_pretrained(save_directory)
+
+            if autoregressive_mtp_training:
+                tmp = model_to_save.config.mtp_num_layers
+                model_to_save.config.mtp_num_layers = model_to_save.config.num_nextn_predict_layers
+                model_to_save.config.num_nextn_predict_layers = tmp
+
+                logger.info(
+                    f"MTP args changing for autoregressive mtp training checkpoint saving RECOVER, mtp_num_layers: {model_to_save.config.mtp_num_layers}, num_nextn_predict_layers: {model_to_save.config.num_nextn_predict_layers}!!"
+                )
             return
 
         # save the string version of dtype to the config, e.g. convert paddle.float32 => "float32"
@@ -3222,7 +3309,10 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     variant = weight_name_suffix() if variant is None else variant
 
         # Attach architecture to the config
-        config_to_save.architectures = [clean_model_class_name(model_to_save.__class__.__name__)]
+        if not config_to_save.architectures:
+            config_to_save.architectures = [clean_model_class_name(model_to_save.__class__.__name__)]
+        if not save_to_hf:
+            config_to_save.source = "paddle"
         # Save the config
         if is_main_process:
             config_to_save.save_pretrained(save_directory)
@@ -3846,6 +3936,7 @@ def save_full_param(
         param_size_bytes = param.numel() * param.element_size()
         total_size += param_size_bytes.item()
         if i % num_saver_ranks == rank:
+            logger.info(f"[Rank {rank}/{moe_sharding_world_size}] Assigned to store parameter {param_key}")
             if current_shard_size_bytes > 0 and (current_shard_size_bytes + param_size_bytes > max_shard_size_bytes):
                 _save_current_shard()
             # Move tensor to CPU since we only need to save it, not compute with it
@@ -3918,7 +4009,8 @@ def replace_name_and_gen_index(path, total_size, save_peft=False):
         index_infos = {}
         index_infos["metadata"] = {}
         index_infos["metadata"]["total_size"] = total_size
-        index_infos["weight_map"] = dict(sorted(index_mapping.items()))
+        # Sort by filename (file index) instead of weight name, zero-padded ensures correct order
+        index_infos["weight_map"] = dict(sorted(index_mapping.items(), key=lambda x: x[1]))
         with open(os.path.join(path, index_file_name), "w") as f:
             json.dump(index_infos, f, indent=4)
 
@@ -3982,8 +4074,12 @@ class HFFormatFullParamSaver:
         self.rank = paddle.distributed.get_rank()
 
         if self.h_group and self.v_group:
-            self.num_saver_ranks = self.h_group.nranks * self.v_group.nranks
-            self.rank = self.h_group.rank + self.v_group.rank * self.h_group.nranks
+            if self.v_group.nranks == 1:
+                self.num_saver_ranks = self.h_group.nranks
+                self.rank = self.h_group.rank
+            else:
+                self.num_saver_ranks = self.h_group.nranks * self.v_group.nranks
+                self.rank = self.h_group.rank + self.v_group.rank * self.h_group.nranks
 
         if self.saved_in_one_node:
             local_world_size = int(os.environ.get("PADDLE_LOCAL_SIZE", 8))

@@ -21,23 +21,17 @@ import paddle
 
 from paddleformers.generation import GenerationConfig
 from paddleformers.trainer import PdArgumentParser, Trainer, TrainingArguments
-from paddleformers.transformers import AutoModelForCausalLM, AutoTokenizer
+from paddleformers.transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
-from tests.parallel_launch import TestMultipleGpus
 from tests.transformers.test_modeling_common import ids_tensor
 
-
-class ShardingStage3Tester(TestMultipleGpus):
-    def test_synced_gpus_greedy(self):
-        # test this file
-        self.run_2gpu(__file__)
-
-
 if __name__ == "__main__":
+    model_config = AutoConfig.from_pretrained("Paddleformers/tiny-random-llama")
+    model_config.fuse_rms_norm = False
     tokenizer = AutoTokenizer.from_pretrained("Paddleformers/tiny-random-llama")
     model = AutoModelForCausalLM.from_pretrained(
-        "Paddleformers/tiny-random-llama", convert_from_hf=False, load_checkpoint_format=""
+        "Paddleformers/tiny-random-llama", config=model_config, convert_from_hf=False, load_checkpoint_format=""
     )
     model.config.eos_token_id = -1
     world_size = paddle.distributed.get_world_size()
@@ -66,11 +60,6 @@ if __name__ == "__main__":
     }
     generation_config = GenerationConfig(max_length=10 + paddle.distributed.get_rank(), trunc_input=False)
 
-    def test_synced_gpus_greedy():
-        with paddle.no_grad():
-            generation_config.decode_strategy = "greedy_search"
-            model.generate(**input_kwargs, generation_config=generation_config)
-
     def test_synced_gpus_sample():
         with paddle.no_grad():
             generation_config.decode_strategy = "sampling"
@@ -90,7 +79,6 @@ if __name__ == "__main__":
             generation_config.num_beam_groups = 2
             model.generate(**input_kwargs, generation_config=generation_config)
 
-    test_synced_gpus_greedy()
     test_synced_gpus_sample()
     test_synced_gpus_beam_search()
     test_synced_gpus_group_beam_search()

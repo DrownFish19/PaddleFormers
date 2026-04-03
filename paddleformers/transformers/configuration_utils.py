@@ -229,13 +229,9 @@ def llmmetaclass(cls):
 class LlmMetaConfig:
     op_fusion_attributes = [
         # name, type, default_value, comment
-        ("use_flash_attention", bool, False, "Only used in `ernie45_vl` and `deepseek_v3_pretrain`."),
-        ("fuse_rms_norm", bool, False, "Whether to fuse RMSNorm for efficiency"),
         ("use_fused_linear_cross_entropy", bool, False, "use fused `linear + cross_entropy` fuse op."),
         ("apply_rope_fusion", bool, False, "Whether to fuse RoPE operation"),
         ("fuse_swiglu", bool, False, "Whether to fuse SwiGLU operations"),
-        ("fuse_attention_qkv", bool, False, "Whether to fuse Attention QKV operations"),
-        ("fuse_attention_ffn", bool, False, "Whether to fuse Attention FFN operations"),
     ]
 
     hybrid_parallel_attributes = [
@@ -254,7 +250,7 @@ class LlmMetaConfig:
         ("context_parallel_size", int, 1, "context_parallel_size"),
         # pp refine recompute
         ("no_recompute_layers", Optional[List[int]], None, "no_recompute_layers"),
-        ("add_tail_layers", int, 0, "Additional layers to append at the end"),
+        ("num_empty_layers_add_in_tail", int, 0, "Additional layers to append at the end"),
         # sep_parallel
         ("sep_parallel_size", int, 1, "sep_parallel_size"),
         ("context_parallel_size", int, 1, "context_parallel_size"),
@@ -270,7 +266,7 @@ class LlmMetaConfig:
             None,
             "Recompute granularity, Choose among ['full', 'core_attn', 'full_attn']",
         ),
-        ("recompute_method", str, None, "Determines which transformer layers will be recomputed."),
+        ("recompute_method", Optional[str], None, "Determines which transformer layers will be recomputed."),
         (
             "recompute_num_layers",
             Optional[int],
@@ -302,8 +298,8 @@ class LlmMetaConfig:
             0,
             "The number of tokens in each subbatch for MoE model processing.",
         ),
-        ("using_fake_gate", bool, False, "Whether to fake gate."),
-        ("ep_communication_type", str, "deepep", 'Communication type used by MoE module "deepep" or "alltoall". '),
+        ("moe_router_force_load_balancing", bool, False, "Whether to fake gate."),
+        ("moe_token_dispatcher_type", str, "deepep", 'Communication type used by MoE module "deepep" or "alltoall". '),
         ("use_unified_moe", bool, False, "Whether to use unified moe."),
         (
             "moe_deepep_num_sms",
@@ -344,7 +340,7 @@ class LlmMetaConfig:
         (
             "router_aux_loss_coef",
             Optional[float],
-            None,
+            0.0,
             "Coefficient for MoE router auxiliary loss (encourages balanced expert usage). Defaults to 0.0 (disable auxiliary loss).",
         ),
         (
@@ -363,8 +359,8 @@ class LlmMetaConfig:
         (
             "moe_router_bias_update_rate",
             float,
-            0.01,
-            "Update rate for MoE router biases (only effective if `moe_router_enable_expert_bias=True`). Controls the magnitude of bias adjustments to prevent unstable updates. Defaults to 0.01.",
+            0.001,
+            "Update rate for MoE router biases (only effective if `moe_router_enable_expert_bias=True`). Controls the magnitude of bias adjustments to prevent unstable updates. Defaults to 0.001.",
         ),
         (
             "moe_shared_expert_overlap",
@@ -417,12 +413,15 @@ class LlmMetaConfig:
     ]
 
     mtp_attributes = [
+        ("train_mtp_only", int, 0, "Whether to train MTP only."),
+        ("mtp_distillation_loss", bool, False, "Whether to use distillation MTP loss."),
         ("num_nextn_predict_layers", int, 0, "Number of nextn predict layers."),
+        ("mtp_num_layers", int, 0, "Whether to use Autoregressive MTP Training, activate if > 1."),
         (
             "mtp_loss_scaling_factor",
             float,
-            1.0,
-            "Loss scaling factor for MTP (Mixture of Token-Parallel) training. Adjusts for imbalanced token distributions. Defaults to 1.0 (no scaling; tune for MTP-specific stability issues).",
+            0.1,
+            "Loss scaling factor for MTP (Mixture of Token-Parallel) training. Adjusts for imbalanced token distributions. Defaults to 0.1.",
         ),
     ]
 
@@ -442,15 +441,15 @@ class LlmMetaConfig:
     ]
 
     model_conf = [
-        ("num_hidden_layers", int, None, "Number of hidden layers in the model."),
-        ("num_attention_heads", int, None, "Number of attention heads in the model."),
-        ("num_key_value_heads", int, None, "Number of key/value heads in the model (for GQA/MQA)."),
-        ("num_experts_per_tok", int, None, "Number of experts to activate per token (for MoE models)."),
-        ("hidden_size", int, None, "Hidden size/dimension of the model."),
-        ("intermediate_size", int, None, "Intermediate size in the feed-forward network."),
-        ("n_routed_experts", int, None, "Number of routed experts in the model (for MoE models)."),
-        ("use_qk_norm", bool, None, "Whether to use query/key normalization."),
-        ("tie_word_embeddings", bool, None, "Whether to tie input and output embeddings."),
+        ("num_hidden_layers", Optional[int], None, "Number of hidden layers in the model."),
+        ("num_attention_heads", Optional[int], None, "Number of attention heads in the model."),
+        ("num_key_value_heads", Optional[int], None, "Number of key/value heads in the model (for GQA/MQA)."),
+        ("num_experts_per_tok", Optional[int], None, "Number of experts to activate per token (for MoE models)."),
+        ("hidden_size", Optional[int], None, "Hidden size/dimension of the model."),
+        ("intermediate_size", Optional[int], None, "Intermediate size in the feed-forward network."),
+        ("n_routed_experts", Optional[int], None, "Number of routed experts in the model (for MoE models)."),
+        ("use_qk_norm", Optional[bool], None, "Whether to use query/key normalization."),
+        ("tie_word_embeddings", Optional[bool], None, "Whether to tie input and output embeddings."),
     ]
 
     model_attributes = [
@@ -748,7 +747,7 @@ class PretrainedConfig:
             `"single_label_classification"` or `"multi_label_classification"`.
         moe_subbatch_token_num_before_dispatch (`int`, *optional*, defaults to 0):
             The number of tokens in a subbatch for MoE.
-        ep_communication_type (`str`, *optional*, defaults to `deepep`):
+        moe_token_dispatcher_type (`str`, *optional*, defaults to `deepep`):
             Communication type for expert parallel. Can be one of `deepep`, `alltoall`.
         use_unified_moe (`bool`, *optional*, defaults to `False`):
             Whether to use unified MoE.
@@ -829,8 +828,6 @@ class PretrainedConfig:
         llm_meta = LlmMetaConfig._get_init()
         self._unsavable_keys.update(LlmMetaConfig._get_unsavable_keys())
         self._unsavable_keys.remove("tensor_model_parallel_size")
-        self._unsavable_keys.remove("fuse_attention_qkv")
-        self._unsavable_keys.remove("fuse_attention_ffn")
         self._unsavable_keys.add("_attn_implementation")
 
         kwargs = set_expected_keys(self, llm_meta, kwargs)
@@ -852,10 +849,6 @@ class PretrainedConfig:
             self.tensor_model_parallel_size = 1
             self.sep_parallel_size = 1
             self.context_parallel_size = 1
-
-        # for transformers fuse
-        self.fuse_attention_qkv = kwargs.pop("fuse_attention_qkv", False)
-        self.fuse_attention_ffn = kwargs.pop("fuse_attention_ffn", False)
 
         # for general components
         self._attn_implementation = kwargs.pop("_attn_implementation", "eager")
@@ -905,9 +898,9 @@ class PretrainedConfig:
         self.dpo_config = kwargs.pop("dpo_config", None)
         self.kto_config = kwargs.pop("kto_config", None)
 
-        self.ep_communication_type = kwargs.pop("ep_communication_type", "deepep")
+        self.moe_token_dispatcher_type = kwargs.pop("moe_token_dispatcher_type", "deepep")
         self.use_unified_moe = kwargs.pop("use_unified_moe", False)
-        self.using_fake_gate = kwargs.pop("using_fake_gate", False)
+        self.moe_router_force_load_balancing = kwargs.pop("moe_router_force_load_balancing", False)
 
         # Tokenizer arguments TODO: eventually tokenizer and models should share the same config
         self.tokenizer_class = kwargs.pop("tokenizer_class", None)
@@ -946,6 +939,9 @@ class PretrainedConfig:
             )
         self._save_to_hf = kwargs.pop("save_to_hf", True)
         self._unsavable_keys.add("_save_to_hf")
+
+        # Initialize model weight for fleet model
+        self.perform_initialization = kwargs.pop("perform_initialization", True)
 
         # Additional attributes without default values
         for key, value in kwargs.items():
@@ -1701,6 +1697,7 @@ def recursive_diff_dict(dict_a, dict_b, config_obj=None):
 ALLOWED_LAYER_TYPES = (
     "full_attention",
     "sliding_attention",
+    "linear_attention",
 )
 
 
